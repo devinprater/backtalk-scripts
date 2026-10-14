@@ -14,7 +14,7 @@
 export const manifest = {
   id: "ai-reader",
   name: "AI reader",
-  version: "1.5",
+  version: "1.6",
   author: "Devin Prater",
   minApiVersion: 2,
   testedApiVersion: 3,
@@ -80,6 +80,7 @@ let quiet = null;
 let retries = 0;
 let errorsLogged = 0;
 let changes = 0;
+let sawWriting = false; // Whether this reply was already being written when we looked.
 
 // ---------------------------------------------------------------------------
 // Helpers over Backtalk's items.
@@ -148,7 +149,6 @@ function newest(items) {
 
 function noteError(error) {
   if (errorsLogged++ < MAX_ERRORS_LOGGED) {
-    console.log("Could not read the screen: " + error);
   }
 }
 
@@ -190,7 +190,7 @@ function geminiResponse() {
   if (!message) return "";
   const parts = [];
   appendGemini(message, parts);
-  return parts.join("\n").trim();
+  return joinParts(parts);
 }
 
 function appendGemini(item, parts) {
@@ -198,12 +198,12 @@ function appendGemini(item, parts) {
   if (id.endsWith("assistant_robin_code_block")) {
     const impl = item.find({ id: "assistant_robin_code_impl" });
     const code = impl ? clean(impl.text) : "";
-    if (code) parts.push(codeBlock(code));
+    if (code) parts.push(asCode(code));
     return;
   }
   if (id.endsWith("assistant_robin_text")) {
     const prose = clean(item.text);
-    if (prose) parts.push(prose);
+    if (prose) parts.push(asProse(prose));
     return;
   }
   for (const kid of kidsOf(item)) appendGemini(kid, parts);
@@ -236,34 +236,43 @@ function chatGptResponse() {
 
   const parts = [];
   appendChatGpt(content, content, parts);
+  if (isCardTitle(parts)) parts.shift();
+  return joinParts(parts);
+}
 
-  // A writing card puts a short card title before the answer. It is the topic,
-  // not the answer. Waypoint dropped any short first part; a line that leads
-  // into a code block, such as "Run this:", reads the same way, so it is kept.
-  if (
-    parts.length >= 2 &&
-    parts[0] !== CODE_START &&
-    parts[1] !== CODE_START &&
-    !parts[0].endsWith(":") &&
-    parts[0].length <= 80 &&
-    parts[1].length > parts[0].length * 2
-  ) {
-    parts.shift();
-  }
-  return parts.join("\n").trim();
+/**
+ * Whether the first part is a writing card's title rather than the answer.
+ *
+ * A card puts a short topic before the answer. Waypoint dropped any short
+ * first part, which could take the opening of a reply with it, and its guard
+ * against code blocks never fired here because a code part is the markers and
+ * the code in one string. So: only prose, never code, and only a fragment
+ * rather than a sentence. A whole sentence at the top of a reply is kept even
+ * when it is short, since losing the opening of a reply is worse than reading
+ * a topic line twice.
+ */
+function isCardTitle(parts) {
+  if (parts.length < 2) return false;
+  const first = parts[0];
+  const next = parts[1];
+  if (first.code || next.code) return false;
+  if (/[.!?:]$/.test(first.text)) return false;
+  return first.text.length <= 80 && next.text.length > first.text.length * 2;
 }
 
 function appendChatGpt(item, boundary, parts) {
   const code = chatGptCode(item);
   if (code !== null) {
-    parts.push(codeBlock(code));
+    parts.push(asCode(code));
     return;
   }
   const kids = kidsOf(item);
   if (kids.length === 0) {
     if (isSuggestion(item, boundary)) return;
     const text = clean(item.text);
-    if (text && !parts.includes(text)) parts.push(text);
+    // Every leaf in reading order: a reply may repeat a paragraph or a list
+    // entry on purpose, and those repeats are part of what it says.
+    if (text) parts.push(asProse(text));
     return;
   }
   for (const kid of kids) appendChatGpt(kid, boundary, parts);
@@ -290,7 +299,9 @@ function chatGptCode(item) {
   const code = [];
   for (const kid of kidsOf(container)) {
     if (!kid || kid.equals(header)) continue;
-    for (const text of leafTexts(kid, [])) if (!code.includes(text)) code.push(text);
+    // Every line in order, repeats included: code repeats lines, such as two
+    // closing braces, or the same call in two branches.
+    for (const text of leafTexts(kid, [])) code.push(text);
   }
   return code.length > 0 ? code.join("\n") : null;
 }
@@ -334,7 +345,7 @@ function claudeResponse() {
         const kid = kids[i];
         if (kid) appendClaude(kid, parts);
       }
-      if (parts.length > 0) return parts.join("\n").trim();
+      if (parts.length > 0) return joinParts(parts);
     }
     message = message.parent;
   }
@@ -346,15 +357,15 @@ function appendClaude(item, parts) {
     const code = [];
     for (const kid of kidsOf(item)) {
       if (!kid || hasDesc(kid, "Copy code")) continue;
-      for (const text of leafTexts(kid, [])) if (!code.includes(text)) code.push(text);
+      for (const text of leafTexts(kid, [])) code.push(text);
     }
-    if (code.length > 0) parts.push(codeBlock(code.join("\n")));
+    if (code.length > 0) parts.push(asCode(code.join("\n")));
     return;
   }
   const kids = kidsOf(item);
   if (kids.length === 0) {
     const text = clean(item.text);
-    if (text && !parts.includes(text)) parts.push(text);
+    if (text) parts.push(asProse(text));
     return;
   }
   for (const kid of kids) appendClaude(kid, parts);
@@ -387,6 +398,22 @@ function codeBlock(code) {
   return CODE_START + "\n" + code + "\n" + CODE_END;
 }
 
+/** A part of a reply: prose, or code with its markers. */
+function asProse(text) {
+  return { text: text, code: false };
+}
+
+function asCode(code) {
+  return { text: codeBlock(code), code: true };
+}
+
+function joinParts(parts) {
+  return parts
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
 function quietSeconds() {
   const value = Number(setting("quiet", 3));
   if (!isFinite(value) || value < 1) return 3;
@@ -400,7 +427,6 @@ function say(text, interrupt) {
 function speakGenerating() {
   if (setting("starting", true) === false) return;
   const packageName = backtalk.app.package;
-  console.log("Generating in " + (NAMES[packageName] || packageName));
   say("Generating", false);
 }
 
@@ -421,20 +447,16 @@ function finish() {
     if (retries++ < MAX_RETRIES) {
       quiet = setTimeout(finish, RETRY_MS);
     } else {
-      console.log("Gave up waiting for the app to stop writing");
     }
     return;
   }
   retries = 0;
   if (!pendingText) {
-    console.log("Nothing to read");
     return;
   }
   if (pendingText === spokenText) {
-    console.log("That reply was already read");
     return;
   }
-  console.log("Reading a reply of " + pendingText.length + " characters:\n" + pendingText);
   spokenText = pendingText;
   say(pendingText, setting("interrupt", false) === true);
 }
@@ -453,8 +475,10 @@ function check() {
   if (!root) return;
 
   const writing = isGenerating(root, packageName);
+  const wasWriting = generating;
   if (writing && !generating) speakGenerating();
   generating = writing;
+  if (writing) sawWriting = true;
 
   const text = latestResponse(root, packageName);
 
@@ -463,13 +487,25 @@ function check() {
     // asked for. Only a change from here on is news. An app can still be
     // drawing when the script loads, so this takes the reply as it settles,
     // then stops: a reply that arrives after this point is news.
+    // A reply the app was already writing when the script loaded is not old
+    // news: it is this reply, and the script commonly loads in the middle of
+    // one. It is left unspoken so that its ending reads it, even if the text
+    // never changes again.
     if (text) {
       pendingText = text;
-      spokenText = text;
+      if (!writing && !sawWriting) spokenText = text;
     }
     if (Date.now() < baselineUntil - 50) return; // The screen is still settling.
     baselined = true;
-    console.log("Starting from a reply of " + text.length + " characters in " + NAMES[packageName]);
+    if (text && text !== spokenText && sawWriting) arm();
+    return;
+  }
+
+  // The app stopping writing is itself news: a reply that arrived complete
+  // while it streamed never changes the text again, so nothing else arms.
+  if (wasWriting && !writing && text && text !== spokenText) {
+    pendingText = text;
+    arm();
     return;
   }
 
@@ -477,11 +513,13 @@ function check() {
 
   if (text === pendingText) return;
   pendingText = text;
+  arm();
+}
+
+/** Start the wait for the app to stop changing the screen. */
+function arm() {
   if (quiet) clearTimeout(quiet);
   quiet = setTimeout(finish, quietSeconds() * 1000);
-  console.log(
-    "A reply of " + text.length + " characters is waiting for quiet in " + NAMES[packageName],
-  );
 }
 
 function schedule() {
@@ -496,6 +534,7 @@ function reset() {
   baselined = false;
   retries = 0;
   changes = 0;
+  sawWriting = false;
   if (scheduled) clearTimeout(scheduled);
   if (quiet) clearTimeout(quiet);
   if (baselineTimer) clearTimeout(baselineTimer);
@@ -511,7 +550,6 @@ backtalk.onContentChange((event) => {
   if (!event || !APPS.includes(event.package)) return;
   changes++;
   if (changes === 1 || changes % 100 === 0) {
-    console.log("Screen changed in " + event.package + " (" + changes + ")");
   }
   schedule();
 });
@@ -519,10 +557,7 @@ backtalk.onContentChange((event) => {
 backtalk.onAppEnter((app) => {
   // A script with apps loads when one of them comes to the front.
   reset();
-  console.log("Looking at " + app.package);
   schedule();
 });
 
 backtalk.onAppLeave(() => reset());
-
-console.log("AI reader loaded");
